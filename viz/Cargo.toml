@@ -1,0 +1,11 @@
+[package]
+name = "se3quad-viz"
+version = "0.1.0"
+edition.workspace = true
+description = "Interactive Bevy visualizer for the SE(3) geometric quadrotor controller."
+
+[dependencies]
+se3quad-core = { path = "../core" }
+nalgebra = "0.33"
+bevy = "0.18"
+bevy_egui = "0.39"

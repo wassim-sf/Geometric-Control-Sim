@@ -1,0 +1,8 @@
+[package]
+name = "se3quad-core"
+version = "0.1.0"
+edition.workspace = true
+description = "Geometric (SE(3)) quadrotor control: dynamics, controllers, and a simulation runner. Rust port of the MATLAB se3quad."
+
+[dependencies]
+nalgebra = "0.33"
