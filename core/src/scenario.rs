@@ -3,7 +3,7 @@
 
 use crate::math::so3_exp;
 use crate::state::QuadState;
-use crate::trajectory::{ControlMode, Trajectory};
+use crate::trajectory::{ControlMode, FlightSegment, Trajectory};
 use nalgebra::{Matrix3, Vector3};
 
 /// A named demonstration case.
@@ -31,6 +31,13 @@ const ALT: f64 = -3.0;
 /// State at rest at `p` with orientation `r`.
 fn at(p: Vector3<f64>, r: Matrix3<f64>) -> QuadState {
     QuadState::at(p, r)
+}
+
+/// Initial attitude whose nose (`b1`) points along `+east` (yaw = 90°) — the
+/// tangent heading of the circular trajectories at `t = 0`, so the moving
+/// scenarios start *on* the trajectory's heading (no 90° startup yaw error).
+fn tangent_heading() -> Matrix3<f64> {
+    so3_exp(&Vector3::new(0.0, 0.0, deg(90.0)))
 }
 
 /// State moving with velocity `v` (used so trajectory-tracking cases start *on*
@@ -170,7 +177,7 @@ pub fn all() -> Vec<Scenario> {
             initial: moving(
                 Vector3::new(2.0, 1.5, ALT),
                 Vector3::new(0.0, 2.0, 0.0),
-                Matrix3::identity(),
+                tangent_heading(),
             ),
             trajectory: Trajectory::Circle {
                 radius: 2.0,
@@ -189,7 +196,7 @@ pub fn all() -> Vec<Scenario> {
             initial: moving(
                 Vector3::new(2.0, 0.0, ALT),
                 Vector3::new(0.0, 2.0 * 1.0, 0.0),
-                Matrix3::identity(),
+                tangent_heading(),
             ),
             trajectory: Trajectory::Circle {
                 radius: 2.0,
@@ -209,7 +216,7 @@ pub fn all() -> Vec<Scenario> {
             initial: moving(
                 Vector3::new(1.5, 0.0, ALT),
                 Vector3::new(0.0, 1.5 * 1.8, 0.0),
-                Matrix3::identity(),
+                tangent_heading(),
             ),
             trajectory: Trajectory::Circle {
                 radius: 1.5,
@@ -260,6 +267,28 @@ pub fn all() -> Vec<Scenario> {
             duration: 20.0,
         },
         Scenario {
+            name: "Mode Schedule".into(),
+            blurb: "Concatenates flight modes in one run — the paper's recommended bring-up \
+                    order. 1) attitude hold, 2) velocity, 3) position, 4) aggressive position.\n\
+                    Expect: the active segment shows in the panel and the controller hands off \
+                    between modes on the fly — attitude-only holds upright, velocity drifts on \
+                    the circle's speed, position then locks onto the path, and the last leg \
+                    tightens it into a fast orbit."
+                .into(),
+            initial: moving(
+                Vector3::new(2.0, 0.0, ALT),
+                Vector3::zeros(),
+                Matrix3::identity(),
+            ),
+            // Fallback single-mode fields (used only if the schedule is cleared);
+            // the live schedule comes from `schedule_for`.
+            trajectory: Trajectory::HoldAttitude {
+                axis_angle: Vector3::zeros(),
+            },
+            control_mode: ControlMode::Attitude,
+            duration: 20.0,
+        },
+        Scenario {
             name: "Live (interactive)".into(),
             blurb: "Drag the target position and heading sliders; the controllers track it live.\n\
                     Expect: smooth chasing of your setpoint. Push the target to extreme angles \
@@ -271,6 +300,42 @@ pub fn all() -> Vec<Scenario> {
             control_mode: ControlMode::Position,
             duration: f64::INFINITY,
         },
+    ]
+}
+
+/// The timed flight-mode schedule for a scenario, or empty for single-mode
+/// scenarios. Chaining attitude → velocity → position → aggressive matches the
+/// paper's bring-up/tuning order.
+pub fn schedule_for(name: &str) -> Vec<FlightSegment> {
+    if name != "Mode Schedule" {
+        return Vec::new();
+    }
+    let circle = Trajectory::Circle {
+        radius: 2.0,
+        omega: 1.0,
+        height: ALT,
+    };
+    vec![
+        FlightSegment::new(
+            "1 · Attitude hold (upright)",
+            3.0,
+            ControlMode::Attitude,
+            Trajectory::HoldAttitude {
+                axis_angle: Vector3::zeros(),
+            },
+        ),
+        FlightSegment::new("2 · Velocity (circle profile)", 5.0, ControlMode::Velocity, circle),
+        FlightSegment::new("3 · Position (lock on circle)", 6.0, ControlMode::Position, circle),
+        FlightSegment::new(
+            "4 · Aggressive position (fast orbit)",
+            6.0,
+            ControlMode::Position,
+            Trajectory::Circle {
+                radius: 1.5,
+                omega: 2.0,
+                height: ALT,
+            },
+        ),
     ]
 }
 
@@ -294,6 +359,7 @@ pub fn resolve(name: &str) -> Option<Scenario> {
         "orbit" | "aggressive" | "aggressive_orbit" => "Aggressive Orbit",
         "fig8" | "figure8" | "figure_eight" => "Figure-Eight",
         "custom" => "Custom Trajectory",
+        "schedule" | "modes" | "mode_schedule" | "concat" => "Mode Schedule",
         "live" => "Live (interactive)",
         _ => return None,
     };

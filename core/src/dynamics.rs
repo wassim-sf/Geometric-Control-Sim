@@ -40,7 +40,13 @@ pub fn deriv_ext(
 
 /// One classical RK4 step of length `dt` holding `(f, moment)` constant, then
 /// re-orthonormalising `R` back onto SO(3).
-pub fn rk4_step(s: &QuadState, f: f64, moment: &Vector3<f64>, p: &QuadParams, dt: f64) -> QuadState {
+pub fn rk4_step(
+    s: &QuadState,
+    f: f64,
+    moment: &Vector3<f64>,
+    p: &QuadParams,
+    dt: f64,
+) -> QuadState {
     let k1 = deriv(s, f, moment, p);
     let k2 = deriv(&s.add_scaled(&k1, dt * 0.5), f, moment, p);
     let k3 = deriv(&s.add_scaled(&k2, dt * 0.5), f, moment, p);

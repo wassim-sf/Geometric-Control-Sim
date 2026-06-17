@@ -10,10 +10,12 @@
 pub mod euler;
 pub mod geometric;
 pub mod quaternion;
+pub mod standalone;
 
 use crate::dirty_derivative::DirtyDerivative;
 use crate::math::{body_to_euler_rates, hat, r_to_zyx, vee};
 use crate::params::QuadParams;
+use crate::safety::Safety;
 use crate::state::QuadState;
 use crate::trajectory::{ControlMode, Target};
 use nalgebra::{Matrix3, Vector3, Vector4};
@@ -97,6 +99,8 @@ pub struct GeometricController {
     /// Stateful sign-naive quaternion error (only used in the `naive` quaternion
     /// case, to demonstrate double-cover unwinding).
     naive_quat: quaternion::NaiveQuatTracker,
+    /// Position-error integral accumulator (only active when `ki > 0`).
+    ix: Vector3<f64>,
 }
 
 impl GeometricController {
@@ -106,7 +110,18 @@ impl GeometricController {
             dv1: DirtyDerivative::new(1, p.tau, p.ts),
             dv2: DirtyDerivative::new(2, p.tau * 10.0, p.ts),
             naive_quat: quaternion::NaiveQuatTracker::new(),
+            ix: Vector3::zeros(),
         }
+    }
+
+    /// Integrate the position error with anti-windup *clamping* (each component
+    /// bounded by `i_max`). Returns the integral term for the force law. The
+    /// *conditional* part of the anti-windup (freezing on saturation) is handled
+    /// by the caller, which reverts `ix` if the commanded thrust saturates.
+    fn integrate(&mut self, ex: &Vector3<f64>, p: &QuadParams) -> Vector3<f64> {
+        self.ix += ex * p.ts;
+        self.ix = self.ix.map(|c| c.clamp(-p.i_max, p.i_max));
+        self.ix
     }
 
     pub fn mode(&self) -> AttitudeMode {
@@ -129,6 +144,7 @@ impl GeometricController {
         p: &QuadParams,
         naive: bool,
         cmode: ControlMode,
+        safety: &Safety,
     ) -> ControlOutput {
         let e3 = Vector3::new(0.0, 0.0, 1.0);
         let xd = target.xd;
@@ -136,8 +152,12 @@ impl GeometricController {
         let (x, v, r, omega) = (state.p, state.v, state.r, state.omega);
 
         // Desired-trajectory derivatives come analytically from the target.
-        let (xd_1, xd_2, xd_3, xd_4) =
-            (target.xd_dot, target.xd_ddot, target.xd_3dot, target.xd_4dot);
+        let (xd_1, xd_2, xd_3, xd_4) = (
+            target.xd_dot,
+            target.xd_ddot,
+            target.xd_3dot,
+            target.xd_4dot,
+        );
         let (b1d_1, b1d_2) = (target.b1d_dot, target.b1d_ddot);
         // The measured velocity is differentiated numerically (feedback signal).
         let v_1 = self.dv1.calculate(v);
@@ -145,8 +165,18 @@ impl GeometricController {
 
         // In velocity mode there is no position feedback, so the proportional
         // position gain (and all of its time-derivatives in the feedforward) is
-        // dropped consistently. Position and attitude modes keep it.
-        let kx = if cmode == ControlMode::Velocity { 0.0 } else { p.kx };
+        // dropped consistently. Position and attitude modes keep it. The integral
+        // term likewise only applies when there *is* a position reference.
+        let kx = if cmode == ControlMode::Velocity {
+            0.0
+        } else {
+            p.kx
+        };
+        let ki = if cmode == ControlMode::Position {
+            p.ki
+        } else {
+            0.0
+        };
 
         // Position / velocity / accel / jerk errors (eq. 17-18).
         let ex = x - xd;
@@ -154,13 +184,24 @@ impl GeometricController {
         let ea = v_1 - xd_2;
         let ej = v_2 - xd_3;
 
-        // Thrust magnitude (eq. 19).
-        let a = -kx * ex - p.kv * ev - p.mass * p.gravity * e3 + p.mass * xd_2;
+        // Integral term (anti-windup). Snapshot so we can freeze it if the
+        // commanded thrust ends up saturating (conditional integration).
+        let ix_prev = self.ix;
+        let ix = if ki > 0.0 {
+            self.integrate(&ex, p)
+        } else {
+            Vector3::zeros()
+        };
+
+        // Thrust magnitude (eq. 19), now with the integral term.
+        let a = -kx * ex - p.kv * ev - ki * ix - p.mass * p.gravity * e3 + p.mass * xd_2;
         let na = a.norm().max(1e-9);
         let f_pos = (-a).dot(&(r * e3));
 
-        // Desired body axes (eq. 23, 38).
-        let b3c = -a / na;
+        // Desired body axes (eq. 23, 38). The safety layer caps the commanded
+        // tilt here, before `Rc` and its feedforward are built from it, so the
+        // limit stays self-consistent.
+        let b3c = safety.limit_tilt(-a / na);
         let c = b3c.cross(&b1d);
         let nc = c.norm().max(1e-9);
         let b2c = c / nc;
@@ -168,7 +209,8 @@ impl GeometricController {
         let rc = Matrix3::from_columns(&[b1c, b2c, b3c]);
 
         // First time-derivatives of the body axes (arXiv:1003.2005, Appendix F).
-        let a_1 = -kx * ev - p.kv * ea + p.mass * xd_3;
+        // The integral contributes `d/dt(-ki·∫ex) = -ki·ex` (and `-ki·ev` to a₂).
+        let a_1 = -kx * ev - p.kv * ea - ki * ex + p.mass * xd_3;
         let b3c_1 = -a_1 / na + (a.dot(&a_1) / na.powi(3)) * a;
         let c_1 = b3c_1.cross(&b1d) + b3c.cross(&b1d_1);
         // NOTE: the original MATLAB used `C/norm(C)` for the first term here; the
@@ -177,7 +219,7 @@ impl GeometricController {
         let b1c_1 = b2c_1.cross(&b3c) + b2c.cross(&b3c_1);
 
         // Second time-derivatives.
-        let a_2 = -kx * ea - p.kv * ej + p.mass * xd_4;
+        let a_2 = -kx * ea - p.kv * ej - ki * ev + p.mass * xd_4;
         let b3c_2 = -a_2 / na
             + (2.0 / na.powi(3)) * a.dot(&a_1) * a_1
             + ((a_1.norm().powi(2) + a.dot(&a_2)) / na.powi(3)) * a
@@ -199,7 +241,12 @@ impl GeometricController {
         // controller is handed `Rd`, `Ωd`, `Ω̇d` directly, and thrust simply
         // holds hover — so the airframe is free to slew to any orientation.
         let (rc, omega_c, omega_c_1, f) = if cmode == ControlMode::Attitude {
-            (target.rd, target.omega_d, target.omega_d_dot, p.mass * p.gravity)
+            (
+                target.rd,
+                target.omega_d,
+                target.omega_d_dot,
+                p.mass * p.gravity,
+            )
         } else {
             let omega_c = vee(&(rc.transpose() * rc_1));
             let omega_c_1 = vee(&(rc.transpose() * rc_2 - hat(&omega_c) * hat(&omega_c)));
@@ -227,11 +274,27 @@ impl GeometricController {
         } else {
             // Geometric moment law: feedback + gyroscopic + SO(3) feedforward.
             -p.kr * er - p.komega * e_omega + omega.cross(&(p.j * omega))
-                - p.j * (hat(&omega) * r.transpose() * rc * omega_c
-                    - r.transpose() * rc * omega_c_1)
+                - p.j
+                    * (hat(&omega) * r.transpose() * rc * omega_c - r.transpose() * rc * omega_c_1)
         };
 
         let psi = 0.5 * (Matrix3::identity() - rc.transpose() * r).trace();
+
+        // Safety supervisor: clamp total thrust and inhibit when disarmed. The
+        // moment is left to the mixer, but a disarmed airframe gets no torque
+        // either (idle motors).
+        let f_raw = f;
+        let f = safety.clamp_thrust(f_raw);
+        // Conditional anti-windup: if the commanded thrust saturated, don't let
+        // the integrator keep accumulating against a limit it can't act on.
+        if ki > 0.0 && (f - f_raw).abs() > 1e-9 {
+            self.ix = ix_prev;
+        }
+        let moment = if safety.inhibited() {
+            Vector3::zeros()
+        } else {
+            moment
+        };
         let rotor_forces = p.rotor_forces(f, &moment);
 
         ControlOutput {

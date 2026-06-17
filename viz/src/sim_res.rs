@@ -3,8 +3,8 @@
 use bevy::prelude::*;
 use nalgebra::Vector3;
 use se3quad_core::{
-    scenario, trajectory::yaw_to_b1d, AttitudeMode, QuadParams, Realism, Scenario, Sim, Target,
-    Trajectory,
+    scenario, trajectory::yaw_to_b1d, AttitudeMode, QuadParams, Realism, Safety, Scenario, Sim,
+    Target, Trajectory,
 };
 
 /// Editable parameters for the user-definable [`Trajectory::Custom`] Lissajous.
@@ -70,6 +70,14 @@ pub struct SimState {
     /// Visibility per controller, indexed like [`AttitudeMode::ALL`].
     pub show: [bool; 3],
     pub trails: bool,
+    /// Draw the expected reference path as a dotted line ahead of the vehicle.
+    pub show_path: bool,
+    /// Environment severity: 0 = off (ideal), 1 = calm, 2 = moderate, 3 = harsh.
+    pub env_choice: usize,
+    /// Per-aspect dropdown selections (refine the active environment).
+    pub noise_choice: usize,
+    pub wind_choice: usize,
+    pub battery_choice: usize,
     /// Render the controllers spread apart (so all three are visible at once).
     pub spread: bool,
     /// Lateral gap between spread controllers [m].
@@ -77,8 +85,16 @@ pub struct SimState {
     /// Use realistic standalone baselines (the naive Euler controller then fails
     /// at gimbal lock) instead of the "fair isolation" where only `eR` differs.
     pub naive: bool,
+    /// Run the Euler/quaternion baselines as standalone single-domain
+    /// controllers (no sharing of the geometric loop). Takes precedence over
+    /// `naive` for those two.
+    pub standalone: bool,
     /// Whether the real-world plant effects are active.
     pub realism_on: bool,
+    /// Use physically-strict positive-only motors (`rotor_min = 0`).
+    pub real_motors: bool,
+    /// Whether the real-drone safety supervisor is active.
+    pub safety_on: bool,
     /// Editable real-world effect parameters (applied on toggle / "Apply").
     pub realism: Realism,
     /// Editable parameters for the custom-trajectory scenario.
@@ -113,10 +129,18 @@ impl Default for SimState {
             accumulator: 0.0,
             show: [true, true, true],
             trails: true,
+            show_path: true,
+            env_choice: 0,
+            noise_choice: 2,
+            wind_choice: 2,
+            battery_choice: 0,
             spread: true,
             gap: 2.6,
             naive: std::env::var("SE3QUAD_NAIVE").is_ok(),
+            standalone: false,
             realism_on: false,
+            real_motors: false,
+            safety_on: false,
             realism: Realism::realistic(),
             custom: CustomTraj::default(),
             live_n: 0.0,
@@ -152,12 +176,84 @@ impl SimState {
         matches!(self.sim.trajectory, Trajectory::Custom { .. })
     }
 
+    /// Select an environment-severity preset (0 off / 1 calm / 2 moderate /
+    /// 3 harsh) and apply it.
+    pub fn apply_env(&mut self, choice: usize) {
+        self.env_choice = choice;
+        self.realism_on = choice != 0;
+        if let Some(preset) = match choice {
+            1 => Some(Realism::low()),
+            2 => Some(Realism::medium()),
+            3 => Some(Realism::harsh()),
+            _ => None,
+        } {
+            self.realism = preset;
+        }
+        self.apply_realism();
+    }
+
+    /// IMU-noise preset (0 none / 1 low / 2 medium / 3 high) — refines the
+    /// active environment's gyro/attitude noise + sensor latency.
+    pub fn set_noise(&mut self, choice: usize) {
+        self.noise_choice = choice;
+        let r = &mut self.realism;
+        let (gyro, att, bias, delay) = match choice {
+            0 => (0.0, 0.0, 0.0, 0),
+            1 => (0.003, 0.001, 0.002, 1),
+            2 => (0.012, 0.005, 0.006, 2),
+            _ => (0.03, 0.012, 0.015, 3),
+        };
+        r.gyro_noise = gyro;
+        r.att_noise = att;
+        r.gyro_bias = Vector3::new(bias, -bias * 0.7, bias * 0.5);
+        r.sensor_delay = delay;
+        self.realism_on = true;
+        self.apply_realism();
+    }
+
+    /// Wind preset (0 calm / 1 breeze / 2 gusty / 3 storm).
+    pub fn set_wind(&mut self, choice: usize) {
+        self.wind_choice = choice;
+        let r = &mut self.realism;
+        let (wx, wy, amp, freq) = match choice {
+            0 => (0.0, 0.0, 0.0, 0.0),
+            1 => (0.4, 0.0, 0.3, 1.0),
+            2 => (0.9, -0.4, 1.0, 1.8),
+            _ => (1.6, -0.8, 2.0, 2.5),
+        };
+        r.wind = Vector3::new(wx, wy, 0.0);
+        r.gust_amp = amp;
+        r.gust_freq = freq;
+        self.realism_on = true;
+        self.apply_realism();
+    }
+
+    /// Battery-status preset (0 full / 1 half / 2 low / 3 draining fast).
+    pub fn set_battery(&mut self, choice: usize) {
+        self.battery_choice = choice;
+        let r = &mut self.realism;
+        let (on, init, sag, drain) = match choice {
+            0 => (false, 1.0, 0.0, 0.0),
+            1 => (true, 0.5, 0.12, 2.0e-4),
+            2 => (true, 0.25, 0.18, 3.0e-4),
+            _ => (true, 1.0, 0.22, 1.2e-3),
+        };
+        r.battery = on;
+        r.battery_init = init;
+        r.battery_sag = sag;
+        r.battery_drain = drain;
+        self.realism_on = true;
+        self.apply_realism();
+    }
+
     /// Apply the current realism preset/parameters to the plant (rebuilds the
     /// airframes and restarts the run).
     pub fn apply_realism(&mut self) {
         let r = if self.realism_on {
             let mut r = self.realism.clone();
             r.enabled = true;
+            // Physically-strict motors can only push.
+            r.rotor_min = if self.real_motors { 0.0 } else { -12.0 };
             r
         } else {
             Realism::ideal()
@@ -165,11 +261,22 @@ impl SimState {
         self.sim.set_realism(r);
         self.accumulator = 0.0;
     }
+
+    /// Apply the safety supervisor (or disable it).
+    pub fn apply_safety(&mut self) {
+        self.sim.set_safety(if self.safety_on {
+            Safety::standard()
+        } else {
+            Safety::off()
+        });
+        self.accumulator = 0.0;
+    }
 }
 
 /// Advance the simulation in fixed `params.ts` steps, scaled by `speed`.
 pub fn step_sim(time: Res<Time>, mut s: ResMut<SimState>) {
     s.sim.naive_baselines = s.naive;
+    s.sim.standalone_baselines = s.standalone;
     if s.is_live() {
         let xd = Vector3::new(s.live_n as f64, s.live_e as f64, -(s.live_up as f64));
         let yaw = s.live_yaw as f64;

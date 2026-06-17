@@ -100,7 +100,10 @@ fn hover_stays_put() {
     sim.run_for(4.0);
     for mode in AttitudeMode::ALL {
         assert!(final_psi(&sim, mode) < 1e-3, "{mode:?} drifted in hover");
-        assert!(final_pos_err(&sim, mode) < 1e-2, "{mode:?} drifted in hover");
+        assert!(
+            final_pos_err(&sim, mode) < 1e-2,
+            "{mode:?} drifted in hover"
+        );
     }
 }
 
@@ -160,6 +163,93 @@ fn realistic_plant_still_hovers_and_tracks() {
             "{name}: realistic tracking error too large"
         );
     }
+}
+
+#[test]
+fn standalone_euler_pid_gimbal_locks_while_others_recover() {
+    // The genuine standalone Euler PID (its own Euler-angle outer loop + Euler-
+    // rate feedback, no shared geometric loop) loses control at the pitch=±90°
+    // singularity; the standalone quaternion controller and the geometric law
+    // both recover. This is the same-domain (no-mixing) comparison.
+    let sc = scenario::resolve("gimbal").unwrap();
+    let mut sim = Sim::new(sc, &AttitudeMode::ALL, QuadParams::default());
+    sim.standalone_baselines = true;
+    sim.run_for(8.0);
+
+    assert!(final_psi(&sim, AttitudeMode::Geometric) < 1e-2);
+    assert!(final_psi(&sim, AttitudeMode::Quaternion) < 1e-2);
+    let euler = sim.instance(AttitudeMode::Euler).unwrap();
+    assert!(
+        euler.diverged || euler.history.last().unwrap().psi > 0.5,
+        "standalone Euler PID should gimbal-lock"
+    );
+}
+
+#[test]
+fn standalone_controllers_agree_at_hover() {
+    // With no large-attitude stress all three single-domain controllers behave
+    // identically (shared small-angle linearisation).
+    let sc = scenario::resolve("hover").unwrap();
+    let mut sim = Sim::new(sc, &AttitudeMode::ALL, QuadParams::default());
+    sim.standalone_baselines = true;
+    sim.run_for(4.0);
+    for mode in AttitudeMode::ALL {
+        assert!(final_psi(&sim, mode) < 1e-2, "{mode:?} drifted in hover");
+    }
+}
+
+#[test]
+fn mode_schedule_runs_through_all_segments() {
+    // The concatenated schedule (attitude → velocity → position → aggressive)
+    // hands off cleanly and ends tracking the final position segment.
+    let sc = scenario::resolve("schedule").unwrap();
+    let mut sim = Sim::new(sc, &[AttitudeMode::Geometric], QuadParams::default());
+    assert!(sim.active_segment_label().unwrap().starts_with("1"));
+    sim.run_for(20.0);
+    assert!(!sim.instance(AttitudeMode::Geometric).unwrap().diverged);
+    assert!(final_psi(&sim, AttitudeMode::Geometric) < 1e-1);
+}
+
+#[test]
+fn integral_term_rejects_steady_disturbance() {
+    // Under a steady wind + battery sag + mass mismatch the pure-PD controller
+    // settles with a position offset; adding the integral term (with anti-windup)
+    // drives that offset substantially smaller.
+    let run = |ki: f64| {
+        let sc = scenario::resolve("hover").unwrap();
+        let params = QuadParams {
+            ki,
+            ..QuadParams::default()
+        };
+        let mut sim = Sim::new(sc, &[AttitudeMode::Geometric], params);
+        sim.set_realism(Realism::medium());
+        sim.run_for(15.0);
+        final_pos_err(&sim, AttitudeMode::Geometric)
+    };
+    let pd = run(0.0);
+    let pid = run(2.0);
+    assert!(pd > 0.05, "expected a steady PD offset, got {pd}");
+    assert!(
+        pid < pd * 0.6,
+        "integral should cut the steady offset (PD={pd}, PID={pid})"
+    );
+}
+
+#[test]
+fn harsh_env_degrades_but_calm_tracks_tightly() {
+    // Good vs. bad conditions: the same gains track tightly in a calm
+    // environment and noticeably worse in a harsh one.
+    let track = |r: Realism| {
+        let sc = scenario::resolve("circle").unwrap();
+        let mut sim = Sim::new(sc, &[AttitudeMode::Geometric], QuadParams::default());
+        sim.set_realism(r);
+        sim.run_for(12.0);
+        final_pos_err(&sim, AttitudeMode::Geometric)
+    };
+    let calm = track(Realism::low());
+    let harsh = track(Realism::harsh());
+    assert!(calm < 0.1, "calm env should track tightly, got {calm}");
+    assert!(harsh > calm, "harsh env should track worse (calm={calm}, harsh={harsh})");
 }
 
 #[test]

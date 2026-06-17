@@ -22,9 +22,48 @@ pub fn draw_overlays(mut gizmos: Gizmos, s: Res<SimState>) {
 
     // World axes at the origin: North (red), East (green), Up (blue).
     let o = Vec3::ZERO;
-    gizmos.line(o, conv::dir_to_bevy(&nalgebra::Vector3::new(1.5, 0.0, 0.0)), css::RED);
-    gizmos.line(o, conv::dir_to_bevy(&nalgebra::Vector3::new(0.0, 1.5, 0.0)), css::LIME);
-    gizmos.line(o, conv::dir_to_bevy(&nalgebra::Vector3::new(0.0, 0.0, -1.5)), css::DEEP_SKY_BLUE);
+    gizmos.line(
+        o,
+        conv::dir_to_bevy(&nalgebra::Vector3::new(1.5, 0.0, 0.0)),
+        css::RED,
+    );
+    gizmos.line(
+        o,
+        conv::dir_to_bevy(&nalgebra::Vector3::new(0.0, 1.5, 0.0)),
+        css::LIME,
+    );
+    gizmos.line(
+        o,
+        conv::dir_to_bevy(&nalgebra::Vector3::new(0.0, 0.0, -1.5)),
+        css::DEEP_SKY_BLUE,
+    );
+
+    // Expected reference path (dotted), sampled ahead of the current time. For
+    // periodic trajectories this traces the whole loop; for a schedule it walks
+    // through the upcoming segments. Drawn per visible controller at its offset.
+    // Objective trail: the path actually traced by the white target marker so
+    // far (like the flight trails, but for the setpoint rather than the drone).
+    // Drawn per visible controller at its render offset, matching its marker.
+    if s.show_path {
+        let color = Color::srgba(1.0, 1.0, 1.0, 0.7);
+        for index in 0..AttitudeMode::ALL.len() {
+            if !s.show[index] {
+                continue;
+            }
+            let off = crate::quad::render_offset(index, s.spread, s.gap);
+            let mut prev: Option<Vec3> = None;
+            for xd in s.sim.target_history.iter().step_by(2) {
+                if !xd.iter().all(|v| v.is_finite()) {
+                    break;
+                }
+                let p = conv::pos_to_bevy(xd) + off;
+                if let Some(pp) = prev {
+                    gizmos.line(pp, p, color);
+                }
+                prev = Some(p);
+            }
+        }
+    }
 
     // Flight trails.
     if s.trails {

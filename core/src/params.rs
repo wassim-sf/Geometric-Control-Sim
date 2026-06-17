@@ -30,6 +30,11 @@ pub struct QuadParams {
     pub kv: f64,
     pub kr: f64,
     pub komega: f64,
+    /// Position integral gain (0 = pure PD, as in the paper). A small `ki`
+    /// rejects steady disturbances (wind, battery sag, mass/CoM mismatch).
+    pub ki: f64,
+    /// Anti-windup bound on each component of the position-error integral [m·s].
+    pub i_max: f64,
 
     /// Mixing matrix: `[f1,f2,f3,f4]^T = mix * [f, Mx, My, Mz]^T`.
     pub mix: Matrix4<f64>,
@@ -68,6 +73,8 @@ impl Default for QuadParams {
             kv: 5.6 * mass,
             kr: 8.81,
             komega: 2.54,
+            ki: 0.0,
+            i_max: 3.0,
             mix,
             wrench,
         }

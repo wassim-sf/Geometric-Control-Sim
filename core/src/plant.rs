@@ -28,6 +28,8 @@ pub struct Plant {
     realism: Realism,
     /// Actuator state — the *actual* per-rotor forces, lagging the command.
     rotor: Vector4<f64>,
+    /// Battery state of charge ∈ [0, 1] (1 = full).
+    charge: f64,
     rng: Rng,
     /// Ring buffer of true states for sensor latency.
     delay_buf: VecDeque<QuadState>,
@@ -46,15 +48,31 @@ impl Plant {
             eff,
             realism: realism.clone(),
             rotor: Vector4::zeros(),
+            charge: if realism.enabled && realism.battery {
+                realism.battery_init.clamp(0.0, 1.0)
+            } else {
+                1.0
+            },
             rng: Rng::new(realism.seed),
             delay_buf: VecDeque::new(),
         }
     }
 
+    /// Battery voltage factor: 1.0 when full, dropping to `1 − battery_sag` at
+    /// empty. Every rotor's achieved output scales by this.
+    fn volt_factor(&self) -> f64 {
+        if self.realism.enabled && self.realism.battery {
+            1.0 - self.realism.battery_sag * (1.0 - self.charge)
+        } else {
+            1.0
+        }
+    }
+
     /// Reconstruct the *achieved* `(thrust, moment)` from the current rotor
-    /// forces via the forward wrench map.
+    /// forces via the forward wrench map, scaled by the battery voltage factor.
     fn achieved_wrench(&self) -> (f64, Vector3<f64>) {
-        let w = self.nominal.wrench * self.rotor;
+        let vf = self.volt_factor();
+        let w = self.nominal.wrench * self.rotor * vf;
         (w[0], Vector3::new(w[1], w[2], w[3]))
     }
 
@@ -83,7 +101,14 @@ impl Plant {
     /// state, wind on time).
     fn rk4_sub(&self, s: &QuadState, f: f64, m: &Vector3<f64>, h: f64, t: f64) -> QuadState {
         let d = |st: &QuadState| {
-            deriv_ext(st, f, m, &self.ext_force(st, t), &self.ext_torque(st, f), &self.eff)
+            deriv_ext(
+                st,
+                f,
+                m,
+                &self.ext_force(st, t),
+                &self.ext_torque(st, f),
+                &self.eff,
+            )
         };
         let k1 = d(s);
         let k2 = d(&s.add_scaled(&k1, h * 0.5));
@@ -101,7 +126,13 @@ impl Plant {
     /// Advance the airframe by one control period `dt`, starting at time `t`,
     /// given the controller's commanded per-rotor forces. Returns the new true
     /// state.
-    pub fn step(&mut self, state: &QuadState, rotor_cmd: Vector4<f64>, dt: f64, t: f64) -> QuadState {
+    pub fn step(
+        &mut self,
+        state: &QuadState,
+        rotor_cmd: Vector4<f64>,
+        dt: f64,
+        t: f64,
+    ) -> QuadState {
         let substeps = if self.realism.enabled {
             self.realism.substeps.max(1)
         } else {
@@ -129,6 +160,10 @@ impl Plant {
                 self.rotor = target;
             }
             let (f, m) = self.achieved_wrench();
+            // Drain the battery in proportion to the thrust delivered.
+            if self.realism.enabled && self.realism.battery {
+                self.charge = (self.charge - self.realism.battery_drain * f.abs() * h).max(0.0);
+            }
             s = self.rk4_sub(&s, f, &m, h, t + i as f64 * h);
         }
         s.r = project_to_so3(&s.r);
@@ -146,7 +181,11 @@ impl Plant {
         while self.delay_buf.len() > self.realism.sensor_delay + 1 {
             self.delay_buf.pop_front();
         }
-        let mut m = self.delay_buf.front().cloned().unwrap_or_else(|| true_state.clone());
+        let mut m = self
+            .delay_buf
+            .front()
+            .cloned()
+            .unwrap_or_else(|| true_state.clone());
 
         // Gyro: constant bias + white noise.
         m.omega += self.realism.gyro_bias + self.realism.gyro_noise * self.rng.gaussian3();

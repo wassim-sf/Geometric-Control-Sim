@@ -19,9 +19,7 @@ pub struct Rng {
 
 impl Rng {
     pub fn new(seed: u64) -> Self {
-        Rng {
-            state: seed.max(1),
-        }
+        Rng { state: seed.max(1) }
     }
 
     fn next_u64(&mut self) -> u64 {
@@ -89,6 +87,17 @@ pub struct Realism {
     /// parasitic torque `com_offset × F_thrust`.
     pub com_offset: Vector3<f64>,
 
+    // --- battery ---
+    /// Model battery voltage sag: as charge drains, every rotor produces less
+    /// thrust for the same command (all rotor outputs scale by the same factor).
+    pub battery: bool,
+    /// Fractional thrust loss at empty charge (e.g. 0.15 ⇒ 15 % weaker at empty).
+    pub battery_sag: f64,
+    /// Charge consumed per newton-second of total thrust [1/(N·s)].
+    pub battery_drain: f64,
+    /// Initial state of charge ∈ [0, 1] (a "low battery" starts already sagging).
+    pub battery_init: f64,
+
     // --- sensors (IMU) ---
     /// Constant gyro bias [rad/s].
     pub gyro_bias: Vector3<f64>,
@@ -123,11 +132,84 @@ impl Realism {
             mass_scale: 1.0,
             inertia_scale: 1.0,
             com_offset: Vector3::zeros(),
+            battery: false,
+            battery_sag: 0.0,
+            battery_drain: 0.0,
+            battery_init: 1.0,
             gyro_bias: Vector3::zeros(),
             gyro_noise: 0.0,
             att_noise: 0.0,
             sensor_delay: 0,
             substeps: 1,
+            seed: 1,
+        }
+    }
+
+    /// **Calm** environment — light, well-behaved conditions. With the paper's
+    /// gains this is the "good tuning works great" case: crisp tracking.
+    pub fn low() -> Self {
+        Realism {
+            enabled: true,
+            actuator: true,
+            rotor_min: -12.0,
+            rotor_max: 32.0,
+            motor_tau: 0.01,
+            drag_lin: 0.1,
+            drag_rot: 0.01,
+            wind: Vector3::zeros(),
+            gust_amp: 0.0,
+            gust_freq: 0.0,
+            mass_scale: 1.0,
+            inertia_scale: 1.0,
+            com_offset: Vector3::zeros(),
+            battery: false,
+            battery_sag: 0.0,
+            battery_drain: 0.0,
+            battery_init: 1.0,
+            gyro_bias: Vector3::new(0.002, -0.001, 0.001),
+            gyro_noise: 0.0015,
+            att_noise: 0.0005,
+            sensor_delay: 0,
+            substeps: 4,
+            seed: 1,
+        }
+    }
+
+    /// **Moderate** environment — the default real-world preset (alias of
+    /// [`Realism::realistic`]): noticeable but flyable degradation.
+    pub fn medium() -> Self {
+        Realism::realistic()
+    }
+
+    /// **Harsh** environment — strong wind/gusts, heavy IMU noise + latency, large
+    /// model mismatch, a draining battery, and a tighter thrust ceiling. The
+    /// paper's fixed gains struggle here: tracking degrades and aggressive cases
+    /// can go unstable — the "this tuning is now badly matched to conditions"
+    /// case. Pair with the integral term + safety to claw some of it back.
+    pub fn harsh() -> Self {
+        Realism {
+            enabled: true,
+            actuator: true,
+            rotor_min: -12.0,
+            rotor_max: 28.0,
+            motor_tau: 0.04,
+            drag_lin: 0.35,
+            drag_rot: 0.04,
+            wind: Vector3::new(0.9, -0.4, 0.0),
+            gust_amp: 1.0,
+            gust_freq: 1.8,
+            mass_scale: 1.06,
+            inertia_scale: 1.08,
+            com_offset: Vector3::new(0.012, -0.009, 0.0),
+            battery: true,
+            battery_sag: 0.18,
+            battery_drain: 5.0e-4,
+            battery_init: 1.0,
+            gyro_bias: Vector3::new(0.015, -0.01, 0.008),
+            gyro_noise: 0.012,
+            att_noise: 0.005,
+            sensor_delay: 2,
+            substeps: 4,
             seed: 1,
         }
     }
@@ -158,12 +240,30 @@ impl Realism {
             mass_scale: 1.02,
             inertia_scale: 1.03,
             com_offset: Vector3::new(0.006, -0.004, 0.0),
+            battery: true,
+            battery_sag: 0.1,
+            battery_drain: 3.0e-4,
+            battery_init: 1.0,
             gyro_bias: Vector3::new(0.006, -0.004, 0.003),
             gyro_noise: 0.004,
             att_noise: 0.0015,
             sensor_delay: 1,
             substeps: 4,
             seed: 1,
+        }
+    }
+
+    /// Physically-strict variant of [`Realism::realistic`] with **positive-only**
+    /// rotors (`rotor_min = 0`). This is how real fixed-pitch quad motors behave:
+    /// they can only push, never pull. The trade-off is honest — the geometric
+    /// thrust law commands negative collective thrust to flip out of full
+    /// inversion, which these motors cannot deliver, so the exact/near-inverted
+    /// recovery demos will legitimately fail. Use this for realistic motors and
+    /// pair it with the [`crate::safety::Safety`] layer for early-test limits.
+    pub fn real_motors() -> Self {
+        Realism {
+            rotor_min: 0.0,
+            ..Realism::realistic()
         }
     }
 

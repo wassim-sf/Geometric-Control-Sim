@@ -2,9 +2,10 @@
 
 use crate::sim_res::SimState;
 use bevy::prelude::*;
-use bevy_egui::{egui, EguiContexts};
 use bevy_egui::egui::Color32;
+use bevy_egui::{egui, EguiContexts};
 use se3quad_core::AttitudeMode;
+use std::cmp::Ordering;
 
 /// Set true when egui wants the pointer, so the orbit camera ignores that input.
 #[derive(Resource, Default)]
@@ -30,6 +31,7 @@ pub fn ui_system(
     egui::SidePanel::left("controls")
         .default_width(280.0)
         .show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(4.0);
             ui.heading("Geometric Control on SE(3)");
             ui.label(
@@ -52,11 +54,13 @@ pub fn ui_system(
                     }
                 });
             ui.label(egui::RichText::new(s.scenarios[s.selected].blurb.clone()).small());
-            ui.label(
-                egui::RichText::new(format!("Flight mode: {}", s.sim.control_mode.label()))
-                    .small()
-                    .strong(),
-            );
+            // Schedule-aware flight-mode line: shows the active segment when the
+            // scenario chains modes, otherwise the single flight mode.
+            let mode_line = match s.sim.active_segment_label() {
+                Some(seg) => format!("Flight mode: {}  ·  {}", s.sim.active_mode().label(), seg),
+                None => format!("Flight mode: {}", s.sim.active_mode().label()),
+            };
+            ui.label(egui::RichText::new(mode_line).small().strong());
             ui.separator();
 
             // Transport.
@@ -98,14 +102,20 @@ pub fn ui_system(
                 });
             }
             ui.add_space(2.0);
-            ui.checkbox(&mut s.naive, "realistic naive baselines");
-            let hint = if s.naive {
-                "Naive baselines on: Euler is a true Euler-frame PD (tumbles at gimbal lock — \
-                 try “Gimbal-Lock Flip”); the quaternion drops its sign fix and UNWINDS (try \
-                 “Quaternion Unwinding”)."
+            // Baseline-comparison mode for the Euler/quaternion controllers.
+            ui.label(egui::RichText::new("Baseline comparison").strong());
+            ui.checkbox(&mut s.naive, "naive baselines (eR only)");
+            ui.checkbox(&mut s.standalone, "standalone same-domain controllers");
+            let hint = if s.standalone {
+                "Standalone: Euler runs a TRUE Euler-angle PID (own outer loop) and gimbal-locks \
+                 at pitch ±90° (try “Gimbal-Lock Flip”); quaternion runs a standalone quaternion \
+                 PD. No domain mixing. (Overrides naive for those two.)"
+            } else if s.naive {
+                "Naive: Euler is an Euler-frame PD on the shared loop (tumbles at gimbal lock); \
+                 the quaternion drops its sign fix and UNWINDS (try “Quaternion Unwinding”)."
             } else {
                 "Fair isolation: all three share the geometric law; only the \
-                 attitude error differs."
+                 attitude error eR differs."
             };
             ui.label(egui::RichText::new(hint).small().weak());
             ui.add_space(4.0);
@@ -122,6 +132,7 @@ pub fn ui_system(
 
             ui.horizontal(|ui| {
                 ui.checkbox(&mut s.trails, "trails");
+                ui.checkbox(&mut s.show_path, "target trail");
                 ui.checkbox(&mut s.spread, "spread apart");
             });
             if s.spread {
@@ -136,8 +147,11 @@ pub fn ui_system(
                 ui.add(egui::Slider::new(&mut s.live_e, -5.0..=5.0).text("east (m)"));
                 ui.add(egui::Slider::new(&mut s.live_up, 0.0..=6.0).text("up (m)"));
                 ui.add(
-                    egui::Slider::new(&mut s.live_yaw, -std::f32::consts::PI..=std::f32::consts::PI)
-                        .text("heading (rad)"),
+                    egui::Slider::new(
+                        &mut s.live_yaw,
+                        -std::f32::consts::PI..=std::f32::consts::PI,
+                    )
+                    .text("heading (rad)"),
                 );
             } else {
                 ui.label(
@@ -153,6 +167,7 @@ pub fn ui_system(
                     .small()
                     .weak(),
             );
+            }); // ScrollArea
         });
 
     // Bottom panel: plots.
@@ -163,7 +178,9 @@ pub fn ui_system(
             ui.horizontal(|ui| {
                 let w = (ui.available_width() - 24.0) / 3.0;
                 plot_panel(ui, &s, w, "Attitude error  Ψ", 2.0, |sm| sm.psi);
-                plot_panel(ui, &s, w, "Position error  |eₓ| (m)", 1.0, |sm| sm.pos_err);
+                plot_panel(ui, &s, w, "Position error  |eₓ| (m)", 1.0, |sm| {
+                    sm.pos_err
+                });
                 plot_panel(ui, &s, w, "Pitch (deg)  — Euler aliasing", 180.0, |sm| {
                     sm.pitch.to_degrees()
                 });
@@ -173,25 +190,84 @@ pub fn ui_system(
     wants.0 = ctx.wants_pointer_input() || ctx.is_pointer_over_area();
 }
 
-/// Real-world plant effects: a master toggle plus editable parameters that take
-/// effect (rebuilding the airframes) when "Apply & restart" is pressed.
+/// Real-world plant effects: an environment-severity preset, a safety toggle,
+/// controller-tuning (`ki`), and editable parameters (incl. battery).
 fn real_world_section(ui: &mut egui::Ui, s: &mut SimState) {
-    let mut on = s.realism_on;
+    // Environment-severity preset (drives good-vs-bad-conditions comparison).
+    let envs = ["Off (ideal)", "Calm", "Moderate", "Harsh"];
+    let mut choice = s.env_choice.min(3);
+    ui.horizontal(|ui| {
+        ui.label("Environment:");
+        egui::ComboBox::from_id_salt("env")
+            .selected_text(envs[choice])
+            .show_ui(ui, |ui| {
+                for (i, name) in envs.iter().enumerate() {
+                    ui.selectable_value(&mut choice, i, *name);
+                }
+            });
+    });
+    if choice != s.env_choice {
+        s.apply_env(choice);
+    }
+
+    // Per-aspect quick presets (refine the active environment).
+    preset_combo(ui, "Noise", &["none", "low", "medium", "high"], s.noise_choice, |s, c| {
+        s.set_noise(c)
+    }, s);
+    preset_combo(ui, "Wind", &["calm", "breeze", "gusty", "storm"], s.wind_choice, |s, c| {
+        s.set_wind(c)
+    }, s);
+    preset_combo(
+        ui,
+        "Battery",
+        &["full", "half", "low", "draining"],
+        s.battery_choice,
+        |s, c| s.set_battery(c),
+        s,
+    );
+
+    // Controller tuning: the integral gain (with anti-windup) is live — it
+    // rejects the steady offset that wind / battery sag / mass mismatch cause.
+    ui.add(
+        egui::Slider::new(&mut s.sim.params.ki, 0.0..=6.0)
+            .text("integral gain ki (anti-windup)"),
+    );
+
+    // Safety supervisor is independent of the plant model (can be used alone).
+    let mut safety = s.safety_on;
     if ui
-        .checkbox(&mut on, "real-world plant (actuator + drag + IMU + wind)")
+        .checkbox(&mut safety, "safety supervisor (arm + thrust/tilt + floor)")
         .changed()
     {
-        s.realism_on = on;
-        s.apply_realism();
+        s.safety_on = safety;
+        s.apply_safety();
     }
     if !s.realism_on {
         ui.label(
-            egui::RichText::new("Off: ideal SE(3) plant with perfect sensors.")
+            egui::RichText::new("Plant: ideal SE(3) with perfect sensors. ki rejects nothing here.")
                 .small()
                 .weak(),
         );
         return;
     }
+    let mut motors = s.real_motors;
+    if ui
+        .checkbox(&mut motors, "physically-strict motors (positive-only)")
+        .changed()
+    {
+        s.real_motors = motors;
+        s.apply_realism();
+    }
+    ui.label(
+        egui::RichText::new(if s.real_motors {
+            "Positive-only rotors: can't reverse-thrust out of inversion — pair with the \
+             safety supervisor; aggressive tracking degrades (gains assume an over-powered plant)."
+        } else {
+            "Rotors allow mild reverse thrust, so recoveries fly; tracking shows realistic lag."
+        })
+        .small()
+        .weak(),
+    );
     egui::CollapsingHeader::new("real-world parameters")
         .default_open(false)
         .show(ui, |ui| {
@@ -207,17 +283,46 @@ fn real_world_section(ui: &mut egui::Ui, s: &mut SimState) {
             ui.label(egui::RichText::new("Model mismatch").small().strong());
             ui.add(egui::Slider::new(&mut r.mass_scale, 0.8..=1.2).text("mass ×"));
             ui.add(egui::Slider::new(&mut r.inertia_scale, 0.8..=1.2).text("inertia ×"));
+            ui.label(egui::RichText::new("Battery").small().strong());
+            ui.checkbox(&mut r.battery, "voltage sag");
+            ui.add(egui::Slider::new(&mut r.battery_sag, 0.0..=0.4).text("sag at empty"));
+            ui.add(
+                egui::Slider::new(&mut r.battery_drain, 0.0..=2.0e-3).text("drain rate"),
+            );
             ui.label(egui::RichText::new("Sensors (IMU)").small().strong());
             ui.add(egui::Slider::new(&mut r.gyro_noise, 0.0..=0.05).text("gyro noise"));
             ui.add(egui::Slider::new(&mut r.att_noise, 0.0..=0.02).text("attitude noise"));
-            ui.add(
-                egui::Slider::new(&mut r.sensor_delay, 0..=5).text("sensor delay (steps)"),
-            );
+            ui.add(egui::Slider::new(&mut r.sensor_delay, 0..=5).text("sensor delay (steps)"));
             ui.add(egui::Slider::new(&mut r.substeps, 1..=10).text("physics substeps"));
             if ui.button("Apply & restart").clicked() {
                 s.apply_realism();
             }
         });
+}
+
+/// A labelled dropdown of named presets; calls `apply(s, selection)` on change.
+fn preset_combo(
+    ui: &mut egui::Ui,
+    label: &str,
+    options: &[&str],
+    current: usize,
+    apply: impl Fn(&mut SimState, usize),
+    s: &mut SimState,
+) {
+    let mut sel = current.min(options.len() - 1);
+    ui.horizontal(|ui| {
+        ui.label(format!("{label}:"));
+        egui::ComboBox::from_id_salt(label)
+            .selected_text(options[sel])
+            .show_ui(ui, |ui| {
+                for (i, name) in options.iter().enumerate() {
+                    ui.selectable_value(&mut sel, i, *name);
+                }
+            });
+    });
+    if sel != current {
+        apply(s, sel);
+    }
 }
 
 /// Editor for the user-definable custom Lissajous trajectory.
@@ -232,12 +337,23 @@ fn custom_traj_section(ui: &mut egui::Ui, s: &mut SimState) {
             ui.label(egui::RichText::new("y = ay·sin(wy·t + py)").small().weak());
             ui.add(egui::Slider::new(&mut c.ay, 0.0..=5.0).text("ay (m)"));
             ui.add(egui::Slider::new(&mut c.wy, 0.0..=3.0).text("wy (rad/s)"));
-            ui.add(egui::Slider::new(&mut c.py, -3.14..=3.14).text("py (rad)"));
-            ui.label(egui::RichText::new("z = up + az·sin(wz·t + pz)").small().weak());
+            ui.add(
+                egui::Slider::new(&mut c.py, -std::f32::consts::PI..=std::f32::consts::PI)
+                    .text("py (rad)"),
+            );
+            ui.label(
+                egui::RichText::new("z = up + az·sin(wz·t + pz)")
+                    .small()
+                    .weak(),
+            );
             ui.add(egui::Slider::new(&mut c.az, 0.0..=3.0).text("az (m)"));
             ui.add(egui::Slider::new(&mut c.wz, 0.0..=3.0).text("wz (rad/s)"));
             ui.add(egui::Slider::new(&mut c.height_up, 0.0..=6.0).text("up (m)"));
-            ui.label(egui::RichText::new("Edits reshape the path live.").small().weak());
+            ui.label(
+                egui::RichText::new("Edits reshape the path live.")
+                    .small()
+                    .weak(),
+            );
         });
 }
 
@@ -270,7 +386,15 @@ fn plot_panel(
             series.push((mode_color32(index), pts));
         }
     }
-    draw_plot(ui, width, 150.0, title, -0.05 * y_max, y_max * 1.05, &series);
+    draw_plot(
+        ui,
+        width,
+        150.0,
+        title,
+        -0.05 * y_max,
+        y_max * 1.05,
+        &series,
+    );
 }
 
 fn draw_plot(
@@ -284,8 +408,7 @@ fn draw_plot(
 ) {
     ui.vertical(|ui| {
         ui.label(egui::RichText::new(title).small().strong());
-        let (resp, painter) =
-            ui.allocate_painter(egui::vec2(width, height), egui::Sense::hover());
+        let (resp, painter) = ui.allocate_painter(egui::vec2(width, height), egui::Sense::hover());
         let rect = resp.rect;
         painter.rect_filled(rect, 2.0, Color32::from_gray(18));
 
@@ -296,14 +419,17 @@ fn draw_plot(
                 x_max = x_max.max(p[0]);
             }
         }
-        if !(x_max > x_min) {
+        if x_max.partial_cmp(&x_min) != Some(Ordering::Greater) {
             x_max = x_min + 1.0;
         }
         let span_y = (y_max - y_min).max(1e-6);
         let map = |x: f64, y: f64| -> egui::Pos2 {
             let fx = ((x - x_min) / (x_max - x_min)) as f32;
             let fy = ((y - y_min) / span_y).clamp(0.0, 1.0) as f32;
-            egui::pos2(rect.left() + fx * rect.width(), rect.bottom() - fy * rect.height())
+            egui::pos2(
+                rect.left() + fx * rect.width(),
+                rect.bottom() - fy * rect.height(),
+            )
         };
 
         // Zero line.

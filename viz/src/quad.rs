@@ -148,10 +148,7 @@ fn spawn_one(
 
 /// Place each quad from its controller's current state, hiding it if the
 /// controller is toggled off or has diverged.
-pub fn update_quads(
-    s: Res<SimState>,
-    mut q: Query<(&QuadView, &mut Transform, &mut Visibility)>,
-) {
+pub fn update_quads(s: Res<SimState>, mut q: Query<(&QuadView, &mut Transform, &mut Visibility)>) {
     for (view, mut tf, mut vis) in &mut q {
         // Hidden only if the controller is toggled off.
         if !s.show[view.index] {
@@ -165,8 +162,8 @@ pub fn update_quads(
         // the failure stays visible rather than vanishing.
         if let Some(inst) = s.sim.instance(view.mode) {
             if inst.state.is_finite() {
-                tf.translation = conv::pos_to_bevy(&inst.state.p)
-                    + render_offset(view.index, s.spread, s.gap);
+                tf.translation =
+                    conv::pos_to_bevy(&inst.state.p) + render_offset(view.index, s.spread, s.gap);
                 tf.rotation = conv::rot_to_bevy(&inst.state.r);
             }
         }

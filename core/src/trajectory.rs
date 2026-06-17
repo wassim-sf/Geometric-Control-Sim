@@ -13,9 +13,10 @@ use nalgebra::{Matrix3, Vector3};
 /// Which quantity the controller is asked to track. The paper distinguishes an
 /// attitude-controlled mode (track `Rd`, `Ωd`) from a position-controlled mode
 /// (track `xd`, `b1d`); we add a velocity-controlled mode in between.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum ControlMode {
     /// Track a desired position `xd` (and heading `b1d`). Full outer loop.
+    #[default]
     Position,
     /// Track a desired velocity `ẋd` (and heading); no position feedback.
     Velocity,
@@ -33,9 +34,25 @@ impl ControlMode {
     }
 }
 
-impl Default for ControlMode {
-    fn default() -> Self {
-        ControlMode::Position
+/// One leg of a [mode schedule](crate::sim::Sim): a flight mode + trajectory held
+/// for `duration` seconds. Chaining several realises the paper's recommended
+/// bring-up order — attitude → velocity → position → aggressive — in one run.
+#[derive(Clone, Debug)]
+pub struct FlightSegment {
+    pub label: String,
+    pub duration: f64,
+    pub mode: ControlMode,
+    pub trajectory: Trajectory,
+}
+
+impl FlightSegment {
+    pub fn new(label: &str, duration: f64, mode: ControlMode, trajectory: Trajectory) -> Self {
+        FlightSegment {
+            label: label.to_string(),
+            duration,
+            mode,
+            trajectory,
+        }
     }
 }
 
@@ -117,11 +134,7 @@ pub enum Trajectory {
         height: f64,
     },
     /// Horizontal figure-eight (Lissajous 1:2).
-    Figure8 {
-        scale: f64,
-        omega: f64,
-        height: f64,
-    },
+    Figure8 { scale: f64, omega: f64, height: f64 },
     /// Climbing helix.
     Helix {
         radius: f64,

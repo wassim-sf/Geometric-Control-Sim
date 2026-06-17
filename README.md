@@ -78,7 +78,7 @@ SE3QUAD_SCENARIO=gimbal cargo run -p se3quad-viz --release   # past gimbal lock
 | **Exact 180° Flip** | Geometric error vanishes at the 180° unstable equilibrium and stalls; quaternion still recovers. |
 | **Gimbal-Lock Flip** | Starts at 100° pitch, past the Euler ±90° singularity. With *realistic naive baselines* on, the Euler controller tumbles here. |
 | Pitch Inversion | Inverted about the pitch axis (175°); recovery crosses the Euler θ=90° singularity. |
-| Position Step | Step to (2, 2, −3) m. |
+| Position Step | Step to (2, 2, −4) m. |
 | Circle / Figure-Eight / Aggressive Orbit | Trajectory tracking with analytic feed-forward. |
 | Live (interactive) | Drive the desired position + heading yourself. |
 
@@ -162,5 +162,3 @@ dirty-derivative filter, which is retained for the measured velocity).
 [1] T. Lee, M. Leok, and N. H. Mcclamroch, *Geometric Tracking Control of a Quadrotor UAV on SE(3)*, in Conference on Decision and Control, 2010, pp. 5420–5425.
 
 [2] T. Lee, M. Leok, and N. H. McClamroch, *Control of Complex Maneuvers for a Quadrotor UAV using Geometric Methods on SE(3)*, [arXiv:1003.2005v4](https://arxiv.org/abs/1003.2005), 2010.
-# Geometric-Control-Sim
-# Geometric-Control-Sim

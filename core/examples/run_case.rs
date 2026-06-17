@@ -7,7 +7,7 @@
 //!     --secs 8 --out /tmp/out.csv
 //! ```
 
-use se3quad_core::{scenario, AttitudeMode, QuadParams, Realism, Sim};
+use se3quad_core::{scenario, AttitudeMode, QuadParams, Realism, Safety, Sim};
 use std::fmt::Write as _;
 use std::fs;
 
@@ -17,7 +17,12 @@ struct Args {
     secs: f64,
     out: Option<String>,
     naive: bool,
+    standalone: bool,
     realistic: bool,
+    real_motors: bool,
+    safety: bool,
+    env: Option<String>,
+    ki: Option<f64>,
 }
 
 fn parse_args() -> Args {
@@ -27,7 +32,12 @@ fn parse_args() -> Args {
         secs: 8.0,
         out: None,
         naive: false,
+        standalone: false,
         realistic: false,
+        real_motors: false,
+        safety: false,
+        env: None,
+        ki: None,
     };
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -56,9 +66,29 @@ fn parse_args() -> Args {
                 args.naive = true;
                 i += 1;
             }
+            "--standalone" => {
+                args.standalone = true;
+                i += 1;
+            }
             "--realistic" => {
                 args.realistic = true;
                 i += 1;
+            }
+            "--real-motors" => {
+                args.real_motors = true;
+                i += 1;
+            }
+            "--safety" => {
+                args.safety = true;
+                i += 1;
+            }
+            "--env" => {
+                args.env = Some(raw[i + 1].clone());
+                i += 2;
+            }
+            "--ki" => {
+                args.ki = Some(raw[i + 1].parse().expect("--ki must be a number"));
+                i += 2;
             }
             other => {
                 eprintln!("warning: ignoring unknown argument `{other}`");
@@ -78,18 +108,42 @@ fn main() {
         .unwrap_or_else(|| panic!("unknown scenario `{}`", args.scenario));
     let name = scenario.name.clone();
 
-    let mut sim = Sim::new(scenario, &args.modes, QuadParams::default());
+    let mut params = QuadParams::default();
+    if let Some(ki) = args.ki {
+        params.ki = ki;
+    }
+    let mut sim = Sim::new(scenario, &args.modes, params);
     sim.naive_baselines = args.naive;
-    if args.realistic {
+    sim.standalone_baselines = args.standalone;
+    if let Some(env) = args.env.as_deref() {
+        let r = match env {
+            "low" | "calm" => Realism::low(),
+            "medium" | "moderate" => Realism::medium(),
+            "harsh" | "high" => Realism::harsh(),
+            _ => panic!("--env must be low|medium|harsh"),
+        };
+        sim.set_realism(r);
+    } else if args.real_motors {
+        sim.set_realism(Realism::real_motors());
+    } else if args.realistic {
         sim.set_realism(Realism::realistic());
+    }
+    if args.safety {
+        sim.set_safety(Safety::standard());
     }
     sim.run_for(args.secs);
 
     // Console summary.
-    println!("scenario: {name}   ({:.1}s @ {} Hz)", args.secs, (1.0 / sim.params.ts) as i64);
+    println!(
+        "scenario: {name}   ({:.1}s @ {} Hz)",
+        args.secs,
+        (1.0 / sim.params.ts) as i64
+    );
     for inst in &sim.instances {
         let last = inst.history.last();
-        let (psi, perr) = last.map(|s| (s.psi, s.pos_err)).unwrap_or((f64::NAN, f64::NAN));
+        let (psi, perr) = last
+            .map(|s| (s.psi, s.pos_err))
+            .unwrap_or((f64::NAN, f64::NAN));
         let status = if inst.diverged { "DIVERGED" } else { "ok" };
         println!(
             "  {:<16} final Ψ = {:>8.4}   |e_x| = {:>8.4} m   [{status}]",
@@ -107,7 +161,7 @@ fn main() {
             .min()
             .unwrap_or(0);
         let mut csv = String::new();
-        csv.push_str("t");
+        csv.push('t');
         for inst in &sim.instances {
             let m = inst.mode.label().replace(' ', "_");
             let _ = write!(csv, ",psi_{m},poserr_{m},f_{m},pitch_{m}");
@@ -117,7 +171,11 @@ fn main() {
             let _ = write!(csv, "{:.4}", sim.instances[0].history[k].t);
             for inst in &sim.instances {
                 let s = inst.history[k];
-                let _ = write!(csv, ",{:.6},{:.6},{:.6},{:.6}", s.psi, s.pos_err, s.f, s.pitch);
+                let _ = write!(
+                    csv,
+                    ",{:.6},{:.6},{:.6},{:.6}",
+                    s.psi, s.pos_err, s.f, s.pitch
+                );
             }
             csv.push('\n');
         }
