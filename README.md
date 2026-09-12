@@ -16,6 +16,13 @@ This repository now contains two implementations:
 * **`matlab/`** — the original MATLAB/Simulink reference implementation.
 
 <p align="center">
+    <img src="docs/demo_gimbal_flip.gif" width="80%" />
+</p>
+
+> *Live demo — Gimbal-Lock Flip.* The interactive visualizer running the three
+> controllers side-by-side, with live attitude/position error plots.
+
+<p align="center">
     <img src="docs/flip_comparison.png" width="80%" />
 </p>
 
