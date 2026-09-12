@@ -16,7 +16,7 @@ This repository now contains two implementations:
 * **`matlab/`** — the original MATLAB/Simulink reference implementation.
 
 <p align="center">
-    <img src="rust/docs/flip_comparison.png" width="80%" />
+    <img src="docs/flip_comparison.png" width="80%" />
 </p>
 
 > *Exact 180° flip.* All three controllers start inverted. The **geometric**
@@ -26,7 +26,7 @@ This repository now contains two implementations:
 > spot of each method is something you can watch happen.
 
 <p align="center">
-    <img src="rust/docs/circle_tracking.png" width="80%" />
+    <img src="docs/circle_tracking.png" width="80%" />
 </p>
 
 > *Circle tracking.* With exact analytic feed-forward the geometric controller
@@ -115,7 +115,7 @@ isn't the *fastest* — its benefit is **global, singularity-free** stability. T
   benefit of avoiding an Euler-angle representation.
 
 <p align="center">
-    <img src="rust/docs/naive_gimbal_failure.png" width="80%" />
+    <img src="docs/naive_gimbal_failure.png" width="80%" />
 </p>
 
 > *Gimbal-Lock Flip, realistic naive baselines.* The Euler controller (orange)
